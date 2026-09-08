@@ -1,0 +1,7 @@
+node_modules/
+package-lock.json.bak
+artifacts/
+playwright-report/
+test-results/
+.playwright/
+screenshots/index.json

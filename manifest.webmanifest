@@ -1,0 +1,19 @@
+{
+  "name": "Kindred Studio — Therian Mask & Character Maker",
+  "short_name": "Kindred",
+  "description": "Design a therian mask and the character who wears it. Works offline; nothing leaves your browser.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#17141c",
+  "theme_color": "#17141c",
+  "categories": ["graphics", "entertainment", "lifestyle"],
+  "icons": [
+    { "src": "icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any" },
+    { "src": "icon-192.png", "type": "image/png", "sizes": "192x192", "purpose": "any" },
+    { "src": "icon-512.png", "type": "image/png", "sizes": "512x512", "purpose": "any" },
+    { "src": "icon-maskable.png", "type": "image/png", "sizes": "512x512", "purpose": "maskable" }
+  ]
+}

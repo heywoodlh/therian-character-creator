@@ -1,0 +1,15 @@
+# The image is built from an explicit file list; nothing else needs to be sent.
+node_modules/
+artifacts/
+playwright-report/
+test-results/
+tests/
+docs/
+.github/
+.git/
+.gitignore
+package.json
+package-lock.json
+playwright.config.mjs
+README.md
+screenshots/

@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      capture-screenshots:
+        description: Upload the review screenshots as an artifact
+        type: boolean
+        default: true
+
+# Least privilege by default; the jobs that need more ask for it themselves.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Supersede pull-request runs freely, but never interrupt a deploy from main.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Keyed on the resolved Playwright version so a bump refetches the browser.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('./node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        id: browser-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Source contract
+        run: npm run test:unit
+
+      - name: Functionality, accessibility, mobile and offline
+        run: npx playwright test
+
+      - name: Upload screenshots
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.capture-screenshots)
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: artifacts/screenshots
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          if-no-files-found: ignore
+          retention-days: 14
+
+  screenshots:
+    name: Post screenshots to the PR
+    needs: test
+    # Skipped for forks: their token cannot write, and there is nothing useful
+    # to fall back to beyond the artifact the test job already uploaded.
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: screenshots
+          path: shots
+        continue-on-error: true
+
+      # Comments cannot carry attachments, so the images are parked on an orphan
+      # branch and linked by raw URL. The branch holds nothing but screenshots
+      # and can be deleted at any time.
+      - name: Publish the images
+        id: publish
+        run: |
+          set -euo pipefail
+          if [ ! -d shots ] || [ -z "$(ls -A shots 2>/dev/null)" ]; then
+            echo "have-images=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SHA='${{ github.event.pull_request.head.sha }}'
+          DIR="pr-${{ github.event.pull_request.number }}/${SHA:0:8}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin ci-screenshots --depth=1 || true
+          if git rev-parse --verify origin/ci-screenshots >/dev/null 2>&1; then
+            git checkout -B ci-screenshots origin/ci-screenshots
+          else
+            git checkout --orphan ci-screenshots
+            git rm -rf . >/dev/null 2>&1 || true
+            echo 'CI screenshots only. Nothing here is part of the app; safe to delete.' > README.md
+            git add README.md
+          fi
+          mkdir -p "$DIR"
+          cp shots/* "$DIR/"
+          git add "$DIR"
+          git commit -m "screenshots for PR #${{ github.event.pull_request.number }} @ ${SHA:0:8}" || true
+          git push origin ci-screenshots
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "have-images=true" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on the pull request
+        uses: actions/github-script@v7
+        env:
+          HAVE_IMAGES: ${{ steps.publish.outputs.have-images }}
+          IMAGE_DIR: ${{ steps.publish.outputs.dir }}
+          TEST_RESULT: ${{ needs.test.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- kindred-screenshots -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const sha = context.payload.pull_request.head.sha.slice(0, 8);
+
+            const lines = [MARKER, `### Screenshots — \`${sha}\``, ''];
+
+            if (process.env.TEST_RESULT !== 'success') {
+              lines.push(`> Tests did not pass on this commit. [See the run](${runUrl}).`, '');
+            }
+
+            if (process.env.HAVE_IMAGES === 'true') {
+              const dir = process.env.IMAGE_DIR;
+              const branch = 'ci-screenshots';
+              const raw = `${context.serverUrl.replace('github.com', 'raw.githubusercontent.com')}/${owner}/${repo}/${branch}/${dir}`;
+              let shots = [];
+              try {
+                shots = JSON.parse(fs.readFileSync(`shots/index.json`, 'utf8'));
+              } catch {
+                shots = fs.readdirSync('shots')
+                  .filter((f) => f.endsWith('.png'))
+                  .map((f) => ({ name: f.replace(/\.png$/, ''), title: f, file: f }));
+              }
+              const desktop = shots.filter((s) => !s.name.startsWith('mobile'));
+              const mobile = shots.filter((s) => s.name.startsWith('mobile'));
+
+              for (const [heading, group] of [['Desktop', desktop], ['Mobile', mobile]]) {
+                if (!group.length) continue;
+                lines.push(`<details open><summary><b>${heading}</b></summary>`, '');
+                for (const shot of group) {
+                  lines.push(`**${shot.title}**`, '', `<img src="${raw}/${shot.file}" width="${shot.name.startsWith('mobile') ? 300 : 720}" alt="${shot.title}">`, '');
+                }
+                lines.push('</details>', '');
+              }
+            } else {
+              lines.push('_No screenshots were produced for this run._', '');
+            }
+
+            lines.push(`[Full run and downloadable artifacts](${runUrl})`);
+            const body = lines.join('\n');
+
+            // One comment per PR, edited in place, rather than a new one per push.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100
+            });
+            const existing = comments.find((c) => c.body?.includes(MARKER));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the app ships. Keep this list in step with the Dockerfile's COPY —
+      # a test asserts the two agree.
+      - name: Stage the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp index.html styles.css app.js sw.js manifest.webmanifest \
+             icon.svg icon-180.png icon-192.png icon-512.png icon-maskable.png \
+             _site/
+          cp CNAME _site/CNAME
+          touch _site/.nojekyll
+          ls -1 _site
+
+      - uses: actions/configure-pages@v6.0.0
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4
